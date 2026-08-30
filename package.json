@@ -1,0 +1,22 @@
+{
+  "name": "agent-peer",
+  "version": "0.1.6",
+  "description": "Daemonless local messaging between Claude Code and Codex CLI sessions",
+  "type": "module",
+  "bin": {
+    "agent-peer": "scripts/agent-peer.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1",
+    "validate:claude": "claude plugin validate ."
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/noopz/agent-peer.git"
+  },
+  "homepage": "https://github.com/noopz/agent-peer#readme",
+  "license": "MIT"
+}

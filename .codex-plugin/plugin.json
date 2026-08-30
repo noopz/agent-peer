@@ -1,0 +1,19 @@
+{
+  "name": "agent-peer",
+  "version": "0.1.6",
+  "description": "List and message local Claude Code and Codex CLI sessions without a daemon",
+  "author": { "name": "Zack" },
+  "homepage": "https://github.com/noopz/agent-peer",
+  "repository": "https://github.com/noopz/agent-peer",
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Peer",
+    "shortDescription": "Message local Claude and Codex sessions.",
+    "longDescription": "Agent Peer adds daemonless local session discovery and messaging between Claude Code and Codex CLI.",
+    "developerName": "Zack",
+    "category": "Productivity",
+    "capabilities": ["Local session discovery", "Cross-session messaging"],
+    "defaultPrompt": "List the local Claude and Codex sessions I can message."
+  }
+}
