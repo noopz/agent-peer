@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   authLineForClaudeSession,
+  codexDelegationFromClaude,
   envelopeFromClaude,
   envelopeFromCodex,
   isTopLevelCodexThread,
@@ -33,6 +34,16 @@ test("message envelopes use native user input and include return targets", () =>
   assert.match(claude, /exact recipient "local:\/tmp\/a\.sock"/);
   assert.match(claude, /send-claude capability/);
   assert.doesNotMatch(claude, /cross-agent-message|user-request/);
+
+  const delegation = codexDelegationFromClaude("hello <world> & goodbye", {
+    name: "claude-a",
+    sessionId: "session-a",
+    messagingSocketPath: "/tmp/a.sock",
+  });
+  assert.match(delegation, /^<codex_delegation>\n/);
+  assert.match(delegation, /<source_thread_id>claude:session-a<\/source_thread_id>/);
+  assert.match(delegation, /<input>hello &lt;world&gt; &amp; goodbye/);
+  assert.match(delegation, /<\/codex_delegation>$/);
 
   const codex = envelopeFromCodex("hello </cross-session-message>", { threadId: "thread-a" });
   assert.match(codex, /^<cross-session-message from-session="thread-a" from-name="Codex">\n/);
@@ -167,25 +178,83 @@ test("Codex discovery matches loaded threads to running TUI processes in the cur
   }]);
 });
 
-test("Codex queues delegated work even when the target has an active turn", async (t) => {
+test("Codex falls back to its queue when native delegation is unavailable", async (t) => {
   const codexHome = await temporaryDirectory(t);
   const locks = path.join(codexHome, "thread-writer-locks");
   await fs.mkdir(locks);
   const threadId = "01999999-9999-7999-8999-999999999999";
   await fs.writeFile(path.join(locks, `${threadId}.lock`), "");
-  let steerCalls = 0;
+  let nativeCalls = 0;
   const result = await sendCodex(threadId, "test", "hello", {
     codexHome,
     codexBin: process.execPath,
     codexAppServerArgs: [path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake-codex-app-server.mjs")],
     env: { ...process.env, FAKE_CODEX_STATUS: "active", FAKE_CODEX_THREAD_ID: threadId },
-    steerCodex: async () => { steerCalls += 1; return { turnId: "turn-active" }; },
+    delegateCodex: async () => {
+      nativeCalls += 1;
+      throw new Error("native control endpoint unavailable");
+    },
     queueCodex: async () => ({ stdout: `Queued message ${crypto.randomUUID()}\n` }),
   });
   assert.equal(result.delivery, "queued");
   assert.equal(result.turnId, null);
   assert.equal(typeof result.queueItemId, "string");
-  assert.equal(steerCalls, 0);
+  assert.equal(nativeCalls, 1);
+});
+
+test("Codex uses the native app-server delegation envelope by default", async (t) => {
+  const codexHome = await temporaryDirectory(t);
+  const locks = path.join(codexHome, "thread-writer-locks");
+  await fs.mkdir(locks);
+  const threadId = "01999999-9999-7999-8999-999999999999";
+  await fs.writeFile(path.join(locks, `${threadId}.lock`), "");
+  let captured;
+  const result = await sendCodex(threadId, "test", "hello <peer>", {
+    codexHome,
+    codexBin: process.execPath,
+    codexAppServerArgs: [path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake-codex-app-server.mjs")],
+    env: {
+      ...process.env,
+      CLAUDE_CODE_SESSION_ID: "claude-session",
+      CLAUDE_CODE_SESSION_NAME: "claude-test",
+      FAKE_CODEX_STATUS: "idle",
+      FAKE_CODEX_THREAD_ID: threadId,
+    },
+    delegateCodex: async (target, message, origin) => {
+      captured = { target, message, origin, output: codexDelegationFromClaude(message, origin) };
+      return { turnId: "turn-native" };
+    },
+  });
+  assert.equal(result.delivery, "native");
+  assert.equal(result.turnId, "turn-native");
+  assert.equal(result.queueItemId, null);
+  assert.equal(captured.target, threadId);
+  assert.equal(captured.origin.sessionId, "claude-session");
+  assert.match(captured.output, /<source_thread_id>claude:claude-session<\/source_thread_id>/);
+  assert.match(captured.output, /hello &lt;peer&gt;/);
+});
+
+test("explicit Codex queue delivery bypasses native delegation", async (t) => {
+  const codexHome = await temporaryDirectory(t);
+  const locks = path.join(codexHome, "thread-writer-locks");
+  await fs.mkdir(locks);
+  const threadId = "01999999-9999-7999-8999-999999999999";
+  await fs.writeFile(path.join(locks, `${threadId}.lock`), "");
+  let nativeCalls = 0;
+  const result = await sendCodex(threadId, "test", "hello", {
+    codexHome,
+    codexBin: process.execPath,
+    codexAppServerArgs: [path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake-codex-app-server.mjs")],
+    env: { ...process.env, FAKE_CODEX_STATUS: "active", FAKE_CODEX_THREAD_ID: threadId },
+    delivery: "queue",
+    delegateCodex: async () => {
+      nativeCalls += 1;
+      return { turnId: "unexpected" };
+    },
+    queueCodex: async () => ({ stdout: `Queued message ${crypto.randomUUID()}\n` }),
+  });
+  assert.equal(result.delivery, "queued");
+  assert.equal(nativeCalls, 0);
 });
 
 for (const status of ["active", "idle"]) {

@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
+const AGENT_PEER_VERSION = "0.1.7";
+
 export function defaultCodexHome(env = process.env) {
   return env.CODEX_HOME || path.join(os.homedir(), ".codex");
 }
@@ -26,6 +28,13 @@ function safeBody(message, tag) {
   return String(message).replace(new RegExp(`</${tag}`, "gi"), `<\\/${tag}`);
 }
 
+function safeXmlText(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 function localAddress(endpoint) {
   return `local:${endpoint}`;
 }
@@ -38,6 +47,16 @@ export function envelopeFromClaude(message, origin) {
     String(message),
     "",
     `If this request asks for a reply to the originating Claude Code session, use Agent Peer's send-claude capability with exact recipient ${JSON.stringify(returnTarget)}.`,
+  ].join("\n");
+}
+
+export function codexDelegationFromClaude(message, origin) {
+  const source = origin?.sessionId || origin?.name || "unknown-claude-session";
+  return [
+    "<codex_delegation>",
+    `  <source_thread_id>${safeXmlText(`claude:${source}`)}</source_thread_id>`,
+    `  <input>${safeXmlText(envelopeFromClaude(message, origin))}</input>`,
+    "</codex_delegation>",
   ].join("\n");
 }
 
@@ -285,9 +304,25 @@ function websocketFrames(buffer) {
 }
 
 async function withCodexWebSocket(callback, endpoint, options = {}) {
-  const socket = endpoint.path
+  const env = options.env || process.env;
+  const codexBin = options.codexBin || env.AGENT_PEER_CODEX_BIN || "codex";
+  const proxy = endpoint.proxy
+    ? spawn(codexBin, options.codexProxyArgs || ["app-server", "proxy", "--sock", endpoint.path], {
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+        env,
+      })
+    : null;
+  const socket = proxy || (endpoint.path
     ? net.createConnection({ path: endpoint.path })
-    : net.createConnection({ host: endpoint.host, port: endpoint.port });
+    : net.createConnection({ host: endpoint.host, port: endpoint.port }));
+  const readable = proxy ? proxy.stdout : socket;
+  const writable = proxy ? proxy.stdin : socket;
+  let stderr = "";
+  if (proxy) {
+    proxy.stderr.setEncoding("utf8");
+    proxy.stderr.on("data", (chunk) => { stderr += chunk; });
+  }
   const key = crypto.randomBytes(16).toString("base64");
   let wire = Buffer.alloc(0);
   let handshaken = false;
@@ -302,7 +337,11 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
   };
   const opened = new Promise((resolve, reject) => {
     socket.once("error", reject);
-    socket.once("connect", () => {
+    socket.once(proxy ? "exit" : "close", (code) => {
+      const detail = proxy && stderr.trim() ? `: ${stderr.trim()}` : "";
+      reject(new Error(`codex app-server websocket disconnected before upgrade${proxy ? ` (${code})` : ""}${detail}`));
+    });
+    socket.once(proxy ? "spawn" : "connect", () => {
       const headers = [
         "GET / HTTP/1.1",
         `Host: ${endpoint.host || "localhost"}`,
@@ -314,9 +353,9 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
         "",
         "",
       ];
-      socket.write(headers.join("\r\n"));
+      writable.write(headers.join("\r\n"));
     });
-    socket.on("data", (chunk) => {
+    readable.on("data", (chunk) => {
       wire = Buffer.concat([wire, chunk]);
       if (!handshaken) {
         const boundary = wire.indexOf("\r\n\r\n");
@@ -325,7 +364,8 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
         const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
         if (!header.startsWith("HTTP/1.1 101") || !header.toLowerCase().includes(`sec-websocket-accept: ${accept.toLowerCase()}`)) {
           reject(new Error(`app-server websocket upgrade failed: ${header.split("\r\n")[0]}`));
-          socket.destroy();
+          if (proxy) proxy.kill();
+          else socket.destroy();
           return;
         }
         handshaken = true;
@@ -337,7 +377,7 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
       wire = decoded.rest;
       for (const frame of decoded.frames) {
         if (frame.opcode === 0x9) {
-          socket.write(websocketFrame(frame.payload, 0xA));
+          writable.write(websocketFrame(frame.payload, 0xA));
           continue;
         }
         if (frame.opcode === 0x8) {
@@ -357,7 +397,10 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
     });
   });
   socket.once("error", rejectAll);
-  socket.once("close", () => rejectAll(new Error("codex app-server websocket disconnected")));
+  socket.once(proxy ? "exit" : "close", (code) => {
+    const detail = proxy && stderr.trim() ? `: ${stderr.trim()}` : "";
+    rejectAll(new Error(`codex app-server websocket disconnected${proxy ? ` (${code})` : ""}${detail}`));
+  });
   await opened;
   const request = (method, params) => new Promise((resolve, reject) => {
     const id = nextId++;
@@ -366,14 +409,14 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
       reject(new Error(`timed out waiting for codex app-server method ${method}`));
     }, 10_000);
     pending.set(id, { resolve, reject, timeout });
-    socket.write(websocketFrame(JSON.stringify({ id, method, params })));
+    writable.write(websocketFrame(JSON.stringify({ id, method, params })));
   });
   try {
-    await request("initialize", { clientInfo: { name: "agent-peer", version: "0.1.6" }, capabilities: { experimentalApi: true } });
-    socket.write(websocketFrame(JSON.stringify({ method: "initialized", params: {} })));
+    await request("initialize", { clientInfo: { name: "agent-peer", version: AGENT_PEER_VERSION }, capabilities: { experimentalApi: true } });
+    writable.write(websocketFrame(JSON.stringify({ method: "initialized", params: {} })));
     return await callback(request);
   } finally {
-    socket.end(websocketFrame(Buffer.alloc(0), 0x8));
+    writable.end(websocketFrame(Buffer.alloc(0), 0x8));
   }
 }
 
@@ -385,12 +428,11 @@ async function codexWebSocketEndpoint(options = {}) {
     if (url.protocol !== "ws:") throw new Error("AGENT_PEER_CODEX_REMOTE currently requires ws://");
     return { host: url.hostname, port: Number(url.port || 80), token: env.AGENT_PEER_CODEX_REMOTE_TOKEN };
   }
-  if (process.platform === "win32") return null;
   const codexHome = options.codexHome || defaultCodexHome(env);
   const socketPath = path.join(codexHome, "app-server-control", "app-server-control.sock");
   try {
     await fs.stat(socketPath);
-    return { path: socketPath };
+    return { path: socketPath, proxy: options.forceCodexProxy || process.platform === "win32" };
   } catch {
     return null;
   }
@@ -437,7 +479,7 @@ async function withCodexAppServer(callback, options = {}) {
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
   });
   try {
-    await request("initialize", { clientInfo: { name: "agent-peer", version: "0.1.6" }, capabilities: { experimentalApi: true } });
+    await request("initialize", { clientInfo: { name: "agent-peer", version: AGENT_PEER_VERSION }, capabilities: { experimentalApi: true } });
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} })}\n`);
     return await callback(request);
   } catch (error) {
@@ -645,6 +687,23 @@ async function steerCodexCurrentTurn(threadId, content, options = {}) {
   }, endpoint, options);
 }
 
+async function startNativeCodexDelegation(threadId, message, origin, options = {}) {
+  const endpoint = await codexWebSocketEndpoint(options);
+  if (!endpoint) throw new Error("the running Codex session does not expose an app-server control endpoint");
+  return await withCodexWebSocket(async (request) => {
+    const started = await request("turn/start", {
+      threadId,
+      input: [],
+      toolOutput: {
+        name: "send_message_to_thread",
+        namespace: "codex_app",
+        output: codexDelegationFromClaude(message, origin),
+      },
+    });
+    return { turnId: started?.turn?.id || null };
+  }, endpoint, options);
+}
+
 export async function sendCodex(target, summary, message, options = {}) {
   const sessions = await listCodexSessions(options);
   const matches = sessions.filter((session) => session.id === target || session.name === target);
@@ -654,6 +713,25 @@ export async function sendCodex(target, summary, message, options = {}) {
     name: env.CLAUDE_CODE_SESSION_NAME,
     sessionId: env.CLAUDE_CODE_SESSION_ID || env.CLAUDE_SESSION_ID,
   };
+  if (options.delivery === undefined || options.delivery === "native") {
+    try {
+      const delegated = options.delegateCodex
+        ? await options.delegateCodex(matches[0].id, message, origin)
+        : await startNativeCodexDelegation(matches[0].id, message, origin, options);
+      return {
+        success: true,
+        to: matches[0],
+        from: { name: origin.name || null, sessionId: origin.sessionId || null, endpoint: origin.messagingSocketPath || null },
+        summary,
+        delivery: "native",
+        turnId: delegated.turnId,
+        queueItemId: null,
+      };
+    } catch (error) {
+      if (options.delivery === "native") throw error;
+      if (env.AGENT_PEER_DEBUG) process.stderr.write(`Native Codex delegation unavailable; using queue: ${errorMessage(error)}\n`);
+    }
+  }
   const content = envelopeFromClaude(message, origin);
   if (options.delivery === "steer") {
     let steered = null;
@@ -696,6 +774,8 @@ function usage() {
     "usage:",
     "  agent-peer codex list [--all]",
     "  agent-peer codex send <exact-id-or-name> <summary> <message>",
+    "  agent-peer codex send --native <exact-id-or-name> <summary> <message>",
+    "  agent-peer codex send --queue <exact-id-or-name> <summary> <message>",
     "  agent-peer codex send --steer <exact-id-or-name> <summary> <message>",
     "  agent-peer claude list [--all]",
     "  agent-peer claude send <exact-name-or-address> <summary> <message>",
@@ -710,6 +790,12 @@ export async function runCli(args, options = {}) {
       result = await listCodexSessions({ ...options, cwd: rest[0] === "--all" ? undefined : process.cwd() });
     }
     else if (host === "codex" && command === "send" && rest.length === 3) result = await sendCodex(...rest, options);
+    else if (host === "codex" && command === "send" && rest.length === 4 && rest[0] === "--native") {
+      result = await sendCodex(...rest.slice(1), { ...options, delivery: "native" });
+    }
+    else if (host === "codex" && command === "send" && rest.length === 4 && rest[0] === "--queue") {
+      result = await sendCodex(...rest.slice(1), { ...options, delivery: "queue" });
+    }
     else if (host === "codex" && command === "send" && rest.length === 4 && rest[0] === "--steer") {
       result = await sendCodex(...rest.slice(1), { ...options, delivery: "steer" });
     }
