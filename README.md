@@ -79,6 +79,8 @@ Claude validates local peer credentials and applies its inbound-message policy. 
 
 Agent Peer resolves only exact unique names, exact thread IDs, or exact local addresses. Child processes are launched with argument arrays and without shell command construction.
 
+Implementation rationale and pinned upstream references live in the [architecture decision records](docs/adr/README.md).
+
 On macOS and Linux, Codex discovery combines running `codex` TUI process working directories with loaded top-level user threads from the stock shared app-server. When multiple loaded threads share a directory, the newest threads are matched to the number of running TUI processes there. Windows discovery uses the app-server's loaded top-level user threads directly because Windows does not expose another process's working directory through the same standard tools. When the shared endpoint is unavailable, Agent Peer combines writer-lock filenames with the state store; an abnormally terminated process can leave a stale entry until Codex cleans its locks.
 
 Codex's shell sandbox does not allow probing Claude's local IPC endpoints. The bundled Codex skills request narrowly scoped host IPC access for Claude discovery and delivery; this is automatically handled according to the user's Codex approval policy.
