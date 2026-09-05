@@ -5,8 +5,11 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { createRpcClient } from "./rpc.mjs";
+import { createWebSocketDecoder, validateWebSocketUpgrade, websocketFrame } from "./websocket.mjs";
 
-const AGENT_PEER_VERSION = "0.1.7";
+const { version: AGENT_PEER_VERSION } = await readJson(new URL("../package.json", import.meta.url));
+const MAX_WEBSOCKET_HEADER_BYTES = 16 * 1024;
 
 export function defaultCodexHome(env = process.env) {
   return env.CODEX_HOME || path.join(os.homedir(), ".codex");
@@ -121,59 +124,59 @@ async function endpointIsLive(endpoint, timeoutMs = 350) {
   });
 }
 
-export async function listClaudeSessions(options = {}) {
+function claudeSessionsDirectory(options) {
   const claudeHome = options.claudeHome || defaultClaudeHome(options.env);
-  const sessionsDirectory = path.join(claudeHome, "sessions");
-  const records = [];
-  for (const filename of (await directoryNames(sessionsDirectory)).filter((name) => /^\d+\.json$/.test(name))) {
-    try {
-      const record = await readJson(path.join(sessionsDirectory, filename));
-      const endpoint = record.messagingSocketPath;
-      if (typeof endpoint !== "string" || !await endpointIsLive(endpoint, options.timeoutMs)) continue;
-      if (options.cwd && !await pathsMatch(record.cwd, options.cwd)) continue;
-      records.push({
-        name: record.name,
-        address: localAddress(endpoint),
-        status: record.status,
-        cwd: record.cwd,
-        pid: record.pid,
-        sessionId: record.sessionId,
-        version: record.version,
-        kind: record.kind,
-        updatedAt: record.updatedAt,
-        _record: record,
-      });
-    } catch {}
-  }
-  return records.sort((left, right) => String(left.name).localeCompare(String(right.name)));
+  return path.join(claudeHome, "sessions");
 }
 
-async function registeredClaudeSessions(options = {}) {
-  const claudeHome = options.claudeHome || defaultClaudeHome(options.env);
-  const sessionsDirectory = path.join(claudeHome, "sessions");
+async function readClaudeSessionRecords(options) {
+  const directory = claudeSessionsDirectory(options);
   const records = [];
-  for (const filename of (await directoryNames(sessionsDirectory)).filter((name) => /^\d+\.json$/.test(name))) {
+  for (const filename of await directoryNames(directory)) {
+    if (!/^\d+\.json$/.test(filename)) continue;
     try {
-      const record = await readJson(path.join(sessionsDirectory, filename));
-      if (typeof record.messagingSocketPath === "string") records.push(record);
-    } catch {}
+      const record = await readJson(path.join(directory, filename));
+      if (record && typeof record === "object") records.push(record);
+    } catch {
+      // Registrations can disappear or be partially written during discovery.
+    }
   }
   return records;
+}
+
+async function registeredClaudeSessions(options) {
+  const records = await readClaudeSessionRecords(options);
+  return records.filter((record) => typeof record.messagingSocketPath === "string");
+}
+
+export async function listClaudeSessions(options = {}) {
+  const records = [];
+  for (const record of await registeredClaudeSessions(options)) {
+    if (options.cwd && !await pathsMatch(record.cwd, options.cwd)) continue;
+    const live = await endpointIsLive(record.messagingSocketPath, options.timeoutMs).catch(() => false);
+    if (!live) continue;
+    records.push({
+      name: record.name,
+      address: localAddress(record.messagingSocketPath),
+      status: record.status,
+      cwd: record.cwd,
+      pid: record.pid,
+      sessionId: record.sessionId,
+      version: record.version,
+      kind: record.kind,
+      updatedAt: record.updatedAt,
+      _record: record,
+    });
+  }
+  return records.sort((left, right) => String(left.name).localeCompare(String(right.name)));
 }
 
 export async function currentClaudeSession(options = {}) {
   const env = options.env || process.env;
   const requestedId = env.CLAUDE_CODE_SESSION_ID || env.CLAUDE_SESSION_ID;
   if (!requestedId) return null;
-  const claudeHome = options.claudeHome || defaultClaudeHome(env);
-  const sessionsDirectory = path.join(claudeHome, "sessions");
-  for (const filename of (await directoryNames(sessionsDirectory)).filter((name) => /^\d+\.json$/.test(name))) {
-    try {
-      const record = await readJson(path.join(sessionsDirectory, filename));
-      if (record.sessionId === requestedId) return record;
-    } catch {}
-  }
-  return null;
+  const records = await readClaudeSessionRecords(options);
+  return records.find((record) => record.sessionId === requestedId) || null;
 }
 
 function endpointDigests(endpoint) {
@@ -183,8 +186,7 @@ function endpointDigests(endpoint) {
 }
 
 export async function authLineForClaudeSession(record, options = {}) {
-  const claudeHome = options.claudeHome || defaultClaudeHome(options.env);
-  const sessionsDirectory = path.join(claudeHome, "sessions");
+  const sessionsDirectory = claudeSessionsDirectory(options);
   const names = await directoryNames(sessionsDirectory);
   const pidKeys = names.filter((name) => name.startsWith(`${record.pid}.`) && /^[0-9]+\.[0-9a-f]{64}\.key$/i.test(name));
   const preferred = endpointDigests(record.messagingSocketPath)
@@ -247,62 +249,6 @@ export async function sendClaude(target, summary, message, options = {}) {
   return { success: true, to: recipient.name, address: localAddress(recipient.messagingSocketPath), from: origin, summary, messageId };
 }
 
-function websocketFrame(payload, opcode = 1) {
-  const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
-  const mask = crypto.randomBytes(4);
-  let header;
-  if (body.length < 126) {
-    header = Buffer.from([0x80 | opcode, 0x80 | body.length]);
-  } else if (body.length <= 0xffff) {
-    header = Buffer.alloc(4);
-    header[0] = 0x80 | opcode;
-    header[1] = 0x80 | 126;
-    header.writeUInt16BE(body.length, 2);
-  } else {
-    header = Buffer.alloc(10);
-    header[0] = 0x80 | opcode;
-    header[1] = 0x80 | 127;
-    header.writeBigUInt64BE(BigInt(body.length), 2);
-  }
-  const masked = Buffer.alloc(body.length);
-  for (let index = 0; index < body.length; index += 1) masked[index] = body[index] ^ mask[index % 4];
-  return Buffer.concat([header, mask, masked]);
-}
-
-function websocketFrames(buffer) {
-  const frames = [];
-  let offset = 0;
-  while (buffer.length - offset >= 2) {
-    const first = buffer[offset];
-    const second = buffer[offset + 1];
-    let length = second & 0x7f;
-    let headerLength = 2;
-    if (length === 126) {
-      if (buffer.length - offset < 4) break;
-      length = buffer.readUInt16BE(offset + 2);
-      headerLength = 4;
-    } else if (length === 127) {
-      if (buffer.length - offset < 10) break;
-      const largeLength = buffer.readBigUInt64BE(offset + 2);
-      if (largeLength > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("oversized app-server websocket frame");
-      length = Number(largeLength);
-      headerLength = 10;
-    }
-    const masked = (second & 0x80) !== 0;
-    const fullHeaderLength = headerLength + (masked ? 4 : 0);
-    if (buffer.length - offset < fullHeaderLength + length) break;
-    let payload = buffer.subarray(offset + fullHeaderLength, offset + fullHeaderLength + length);
-    if (masked) {
-      const mask = buffer.subarray(offset + headerLength, offset + headerLength + 4);
-      payload = Buffer.from(payload);
-      for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4];
-    }
-    frames.push({ fin: (first & 0x80) !== 0, opcode: first & 0x0f, payload });
-    offset += fullHeaderLength + length;
-  }
-  return { frames, rest: buffer.subarray(offset) };
-}
-
 async function withCodexWebSocket(callback, endpoint, options = {}) {
   const env = options.env || process.env;
   const codexBin = options.codexBin || env.AGENT_PEER_CODEX_BIN || "codex";
@@ -313,9 +259,11 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
         env,
       })
     : null;
-  const socket = proxy || (endpoint.path
-    ? net.createConnection({ path: endpoint.path })
-    : net.createConnection({ host: endpoint.host, port: endpoint.port }));
+  let socket = proxy;
+  if (!socket) {
+    const address = endpoint.path ? { path: endpoint.path } : { host: endpoint.host, port: endpoint.port };
+    socket = net.createConnection(address);
+  }
   const readable = proxy ? proxy.stdout : socket;
   const writable = proxy ? proxy.stdin : socket;
   let stderr = "";
@@ -326,20 +274,36 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
   const key = crypto.randomBytes(16).toString("base64");
   let wire = Buffer.alloc(0);
   let handshaken = false;
-  let nextId = 1;
-  const pending = new Map();
-  const rejectAll = (error) => {
-    for (const waiter of pending.values()) {
-      clearTimeout(waiter.timeout);
-      waiter.reject(error);
-    }
-    pending.clear();
+  const rpc = createRpcClient((message) => {
+    writable.write(websocketFrame(JSON.stringify(message)));
+  }, options.timeoutMs);
+  let rejectOpened;
+  const decode = createWebSocketDecoder(rpc.receive, (payload) => {
+    writable.write(websocketFrame(payload, 0xA));
+  });
+  const stop = () => {
+    if (proxy) {
+      proxy.stdin.destroy();
+      proxy.stdout.destroy();
+      proxy.stderr.destroy();
+      proxy.kill();
+    } else socket.destroy();
+  };
+  const fail = (error) => {
+    rejectOpened(error);
+    rpc.close(error);
+    stop();
   };
   const opened = new Promise((resolve, reject) => {
-    socket.once("error", reject);
+    rejectOpened = reject;
+    socket.once("error", fail);
+    if (proxy) {
+      readable.once("error", fail);
+      writable.once("error", fail);
+    }
     socket.once(proxy ? "exit" : "close", (code) => {
       const detail = proxy && stderr.trim() ? `: ${stderr.trim()}` : "";
-      reject(new Error(`codex app-server websocket disconnected before upgrade${proxy ? ` (${code})` : ""}${detail}`));
+      fail(new Error(`codex app-server websocket disconnected${proxy ? ` (${code})` : ""}${detail}`));
     });
     socket.once(proxy ? "spawn" : "connect", () => {
       const headers = [
@@ -356,67 +320,36 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
       writable.write(headers.join("\r\n"));
     });
     readable.on("data", (chunk) => {
-      wire = Buffer.concat([wire, chunk]);
-      if (!handshaken) {
-        const boundary = wire.indexOf("\r\n\r\n");
-        if (boundary < 0) return;
-        const header = wire.subarray(0, boundary).toString("utf8");
-        const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
-        if (!header.startsWith("HTTP/1.1 101") || !header.toLowerCase().includes(`sec-websocket-accept: ${accept.toLowerCase()}`)) {
-          reject(new Error(`app-server websocket upgrade failed: ${header.split("\r\n")[0]}`));
-          if (proxy) proxy.kill();
-          else socket.destroy();
-          return;
+      try {
+        wire = Buffer.concat([wire, chunk]);
+        if (!handshaken) {
+          const boundary = wire.indexOf("\r\n\r\n");
+          if ((boundary < 0 ? wire.length : boundary) > MAX_WEBSOCKET_HEADER_BYTES) {
+            throw new Error("oversized app-server websocket upgrade headers");
+          }
+          if (boundary < 0) return;
+          validateWebSocketUpgrade(wire.subarray(0, boundary).toString("utf8"), key);
+          handshaken = true;
+          wire = wire.subarray(boundary + 4);
+          resolve();
         }
-        handshaken = true;
-        wire = wire.subarray(boundary + 4);
-        resolve();
-      }
-      if (!handshaken || wire.length === 0) return;
-      const decoded = websocketFrames(wire);
-      wire = decoded.rest;
-      for (const frame of decoded.frames) {
-        if (frame.opcode === 0x9) {
-          writable.write(websocketFrame(frame.payload, 0xA));
-          continue;
-        }
-        if (frame.opcode === 0x8) {
-          rejectAll(new Error("codex app-server websocket closed"));
-          continue;
-        }
-        if (frame.opcode !== 0x1) continue;
-        let message;
-        try { message = JSON.parse(frame.payload.toString("utf8")); } catch { continue; }
-        const waiter = pending.get(message.id);
-        if (!waiter) continue;
-        pending.delete(message.id);
-        clearTimeout(waiter.timeout);
-        if (message.error) waiter.reject(new Error(message.error.message || JSON.stringify(message.error)));
-        else waiter.resolve(message.result);
+        decode(wire);
+        wire = Buffer.alloc(0);
+      } catch (error) {
+        fail(error);
       }
     });
   });
-  socket.once("error", rejectAll);
-  socket.once(proxy ? "exit" : "close", (code) => {
-    const detail = proxy && stderr.trim() ? `: ${stderr.trim()}` : "";
-    rejectAll(new Error(`codex app-server websocket disconnected${proxy ? ` (${code})` : ""}${detail}`));
-  });
-  await opened;
-  const request = (method, params) => new Promise((resolve, reject) => {
-    const id = nextId++;
-    const timeout = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error(`timed out waiting for codex app-server method ${method}`));
-    }, 10_000);
-    pending.set(id, { resolve, reject, timeout });
-    writable.write(websocketFrame(JSON.stringify({ id, method, params })));
-  });
+  const upgradeTimeout = setTimeout(() => fail(new Error("timed out upgrading codex app-server websocket")), options.timeoutMs ?? 10_000);
   try {
-    await request("initialize", { clientInfo: { name: "agent-peer", version: AGENT_PEER_VERSION }, capabilities: { experimentalApi: true } });
-    writable.write(websocketFrame(JSON.stringify({ method: "initialized", params: {} })));
-    return await callback(request);
+    await opened;
+    clearTimeout(upgradeTimeout);
+    await initializeCodexClient(rpc);
+    return await callback(rpc.request);
   } finally {
-    writable.end(websocketFrame(Buffer.alloc(0), 0x8));
+    clearTimeout(upgradeTimeout);
+    rpc.close();
+    stop();
   }
 }
 
@@ -438,6 +371,14 @@ async function codexWebSocketEndpoint(options = {}) {
   }
 }
 
+async function initializeCodexClient(rpc) {
+  await rpc.request("initialize", {
+    clientInfo: { name: "agent-peer", version: AGENT_PEER_VERSION },
+    capabilities: { experimentalApi: true },
+  });
+  rpc.notify("initialized", {});
+}
+
 async function withCodexAppServer(callback, options = {}) {
   const env = options.env || process.env;
   const codexBin = options.codexBin || env.AGENT_PEER_CODEX_BIN || "codex";
@@ -446,42 +387,19 @@ async function withCodexAppServer(callback, options = {}) {
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const lines = readline.createInterface({ input: child.stdout });
-  let nextId = 1;
-  const pending = new Map();
-  const rejectAll = (error) => {
-    for (const waiter of pending.values()) {
-      clearTimeout(waiter.timeout);
-      waiter.reject(error);
-    }
-    pending.clear();
-  };
-  lines.on("line", (line) => {
-    let frame;
-    try { frame = JSON.parse(line); } catch { return; }
-    const waiter = pending.get(frame.id);
-    if (!waiter) return;
-    pending.delete(frame.id);
-    clearTimeout(waiter.timeout);
-    if (frame.error) waiter.reject(new Error(frame.error.message || JSON.stringify(frame.error)));
-    else waiter.resolve(frame.result);
-  });
-  child.once("error", rejectAll);
+  const rpc = createRpcClient((message) => {
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
+  }, options.timeoutMs);
+  lines.on("line", rpc.receive);
+  child.once("error", rpc.close);
+  child.stdin.once("error", rpc.close);
+  child.stdout.once("error", rpc.close);
   child.once("exit", (code) => {
-    if (pending.size > 0) rejectAll(new Error(`codex app-server exited with ${code}: ${stderr.trim()}`));
-  });
-  const request = (method, params) => new Promise((resolve, reject) => {
-    const id = nextId++;
-    const timeout = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error(`timed out waiting for codex app-server method ${method}`));
-    }, 10_000);
-    pending.set(id, { resolve, reject, timeout });
-    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    rpc.close(new Error(`codex app-server exited with ${code}`));
   });
   try {
-    await request("initialize", { clientInfo: { name: "agent-peer", version: AGENT_PEER_VERSION }, capabilities: { experimentalApi: true } });
-    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} })}\n`);
-    return await callback(request);
+    await initializeCodexClient(rpc);
+    return await callback(rpc.request);
   } catch (error) {
     const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
     throw new Error(`${errorMessage(error)}${suffix}`);
@@ -489,11 +407,24 @@ async function withCodexAppServer(callback, options = {}) {
     const closed = child.exitCode === null && child.signalCode === null
       ? new Promise((resolve) => child.once("close", resolve))
       : Promise.resolve();
+    rpc.close();
     lines.close();
     child.stdin.end();
     child.kill();
     await closed;
   }
+}
+
+async function* codexPages(request, method, params = {}) {
+  const seenCursors = new Set();
+  let cursor;
+  do {
+    const result = await request(method, { limit: 100, ...params, cursor });
+    yield Array.isArray(result?.data) ? result.data : [];
+    cursor = result?.nextCursor || null;
+    if (cursor && seenCursors.has(cursor)) throw new Error(`repeated cursor from codex app-server method ${method}`);
+    seenCursors.add(cursor);
+  } while (cursor);
 }
 
 async function loadedCodexThreads(options = {}) {
@@ -503,12 +434,7 @@ async function loadedCodexThreads(options = {}) {
   try {
     return await withCodexWebSocket(async (request) => {
       const ids = [];
-      let cursor;
-      do {
-        const loaded = await request("thread/loaded/list", { limit: 100, cursor });
-        ids.push(...(Array.isArray(loaded?.data) ? loaded.data : []));
-        cursor = loaded?.nextCursor || null;
-      } while (cursor);
+      for await (const page of codexPages(request, "thread/loaded/list")) ids.push(...page);
       return await Promise.all(ids.map(async (threadId) => {
         const result = await request("thread/read", { threadId, includeTurns: false });
         return result?.thread || null;
@@ -585,18 +511,9 @@ export async function listCodexSessions(options = {}) {
   const codexHome = options.codexHome || defaultCodexHome(env);
   const loadedThreads = await loadedCodexThreads(options);
   if (loadedThreads !== null) {
-    const userThreads = loadedThreads.filter((thread) =>
-      thread
-      && isTopLevelCodexThread(thread)
-      && (!thread.threadSource || thread.threadSource === "user")
-    );
+    const userThreads = loadedThreads.filter(isUserCodexThread);
     const liveThreads = await selectThreadsForRunningCodexProcesses(userThreads, options);
-    const matching = [];
-    for (const thread of liveThreads) {
-      if (options.cwd && !await pathsMatch(thread.cwd, options.cwd)) continue;
-      matching.push(thread);
-    }
-    return matching.map(codexSessionSummary);
+    return await summarizeCodexSessions(liveThreads, options.cwd);
   }
   const activeIds = new Set(
     (await directoryNames(path.join(codexHome, "thread-writer-locks")))
@@ -606,23 +523,38 @@ export async function listCodexSessions(options = {}) {
   if (activeIds.size === 0) return [];
   const threads = await withCodexAppServer(async (request) => {
     const found = [];
-    let cursor;
-    do {
-      const result = await request("thread/list", {
-        limit: 100,
-        cursor,
-        sortKey: "updated_at",
-        sortDirection: "desc",
-        archived: false,
-        cwd: options.cwd || undefined,
-        useStateDbOnly: true,
-      });
-      found.push(...(Array.isArray(result?.data) ? result.data : []));
-      cursor = result?.nextCursor || null;
-    } while (cursor && ![...activeIds].every((id) => found.some((thread) => thread.id === id)));
+    const missingIds = new Set(activeIds);
+    const params = {
+      sortKey: "updated_at",
+      sortDirection: "desc",
+      archived: false,
+      cwd: options.cwd || undefined,
+      useStateDbOnly: true,
+    };
+    for await (const page of codexPages(request, "thread/list", params)) {
+      for (const thread of page) {
+        if (!thread || !missingIds.delete(thread.id)) continue;
+        found.push(thread);
+      }
+      if (missingIds.size === 0) break;
+    }
     return found;
   }, options);
-  return threads.filter((thread) => activeIds.has(thread.id) && isTopLevelCodexThread(thread)).map(codexSessionSummary);
+  return await summarizeCodexSessions(threads.filter(isUserCodexThread), options.cwd);
+}
+
+function isUserCodexThread(thread) {
+  if (!isTopLevelCodexThread(thread)) return false;
+  return !thread.threadSource || thread.threadSource === "user";
+}
+
+async function summarizeCodexSessions(threads, cwd) {
+  const matching = [];
+  for (const thread of threads) {
+    if (cwd && !await pathsMatch(thread.cwd, cwd)) continue;
+    matching.push(codexSessionSummary(thread));
+  }
+  return matching;
 }
 
 function codexSessionSummary(thread) {
@@ -636,8 +568,10 @@ function codexSessionSummary(thread) {
 }
 
 export function isTopLevelCodexThread(thread) {
-  const sourceIsSubagent = thread?.source && typeof thread.source === "object" && "subagent" in thread.source;
-  return thread?.parentThreadId == null && !sourceIsSubagent;
+  if (!thread || thread.parentThreadId != null) return false;
+  const source = thread.source;
+  if (!source || typeof source !== "object") return true;
+  return !("subagent" in source);
 }
 
 async function spawnCapture(command, args, options = {}) {
@@ -661,14 +595,13 @@ async function steerCodexCurrentTurn(threadId, content, options = {}) {
   const endpoint = await codexWebSocketEndpoint(options);
   if (!endpoint) return null;
   return await withCodexWebSocket(async (request) => {
-    const loadedIds = [];
-    let cursor;
-    do {
-      const loaded = await request("thread/loaded/list", { limit: 100, cursor });
-      loadedIds.push(...(Array.isArray(loaded?.data) ? loaded.data : []));
-      cursor = loaded?.nextCursor || null;
-    } while (cursor && !loadedIds.includes(threadId));
-    if (!loadedIds.includes(threadId)) return null;
+    let isLoaded = false;
+    for await (const ids of codexPages(request, "thread/loaded/list")) {
+      if (!ids.includes(threadId)) continue;
+      isLoaded = true;
+      break;
+    }
+    if (!isLoaded) return null;
     const turns = await request("thread/turns/list", {
       threadId,
       limit: 1,
@@ -713,20 +646,25 @@ export async function sendCodex(target, summary, message, options = {}) {
     name: env.CLAUDE_CODE_SESSION_NAME,
     sessionId: env.CLAUDE_CODE_SESSION_ID || env.CLAUDE_SESSION_ID,
   };
+  const recipient = matches[0];
+  const result = {
+    success: true,
+    to: recipient,
+    from: {
+      name: origin.name || null,
+      sessionId: origin.sessionId || null,
+      endpoint: origin.messagingSocketPath || null,
+    },
+    summary,
+    turnId: null,
+    queueItemId: null,
+  };
   if (options.delivery === undefined || options.delivery === "native") {
     try {
       const delegated = options.delegateCodex
-        ? await options.delegateCodex(matches[0].id, message, origin)
-        : await startNativeCodexDelegation(matches[0].id, message, origin, options);
-      return {
-        success: true,
-        to: matches[0],
-        from: { name: origin.name || null, sessionId: origin.sessionId || null, endpoint: origin.messagingSocketPath || null },
-        summary,
-        delivery: "native",
-        turnId: delegated.turnId,
-        queueItemId: null,
-      };
+        ? await options.delegateCodex(recipient.id, message, origin)
+        : await startNativeCodexDelegation(recipient.id, message, origin, options);
+      return { ...result, delivery: "native", turnId: delegated.turnId };
     } catch (error) {
       if (options.delivery === "native") throw error;
       if (env.AGENT_PEER_DEBUG) process.stderr.write(`Native Codex delegation unavailable; using queue: ${errorMessage(error)}\n`);
@@ -737,33 +675,21 @@ export async function sendCodex(target, summary, message, options = {}) {
     let steered = null;
     try {
       steered = options.steerCodex
-        ? await options.steerCodex(matches[0].id, content)
-        : await steerCodexCurrentTurn(matches[0].id, content, options);
+        ? await options.steerCodex(recipient.id, content)
+        : await steerCodexCurrentTurn(recipient.id, content, options);
     } catch (error) {
       if (env.AGENT_PEER_DEBUG) process.stderr.write(`Codex steering unavailable; using queue: ${errorMessage(error)}\n`);
     }
-    if (steered) return {
-      success: true,
-      to: matches[0],
-      from: { name: origin.name || null, sessionId: origin.sessionId || null, endpoint: origin.messagingSocketPath || null },
-      summary,
-      delivery: "steered",
-      turnId: steered.turnId,
-      queueItemId: null,
-    };
+    if (steered) return { ...result, delivery: "steered", turnId: steered.turnId };
   }
   const codexBin = options.codexBin || env.AGENT_PEER_CODEX_BIN || "codex";
   const queued = options.queueCodex
-    ? await options.queueCodex(matches[0].id, content)
-    : await spawnCapture(codexBin, ["queue", "--thread", matches[0].id, "--message", content], options);
+    ? await options.queueCodex(recipient.id, content)
+    : await spawnCapture(codexBin, ["queue", "--thread", recipient.id, "--message", content], options);
   const stdout = queued.stdout || "";
   return {
-    success: true,
-    to: matches[0],
-    from: { name: origin.name || null, sessionId: origin.sessionId || null, endpoint: origin.messagingSocketPath || null },
-    summary,
+    ...result,
     delivery: "queued",
-    turnId: null,
     queueItemId: stdout.match(/Queued message ([0-9a-f-]{36})/i)?.[1] || queued.queueItemId || null,
     output: stdout.trim(),
   };
@@ -782,31 +708,39 @@ function usage() {
   ].join("\n");
 }
 
-export async function runCli(args, options = {}) {
+export function parseCliArgs(args) {
   const [host, command, ...rest] = args;
+  if (!["codex", "claude"].includes(host)) return null;
+  if (command === "list") {
+    if (rest.length === 0) return { host, command, all: false };
+    if (rest.length === 1 && rest[0] === "--all") return { host, command, all: true };
+    return null;
+  }
+  if (command !== "send") return null;
+  if (rest.length === 3) return { host, command, operands: rest };
+  if (host !== "codex" || rest.length !== 4) return null;
+  const [flag, ...operands] = rest;
+  if (!["--native", "--queue", "--steer"].includes(flag)) return null;
+  return { host, command, operands, delivery: flag.slice(2) };
+}
+
+export async function runCli(args, options = {}) {
+  const parsed = parseCliArgs(args);
+  if (!parsed) {
+    console.error(usage());
+    process.exitCode = 2;
+    return;
+  }
   try {
     let result;
-    if (host === "codex" && command === "list" && (rest.length === 0 || (rest.length === 1 && rest[0] === "--all"))) {
-      result = await listCodexSessions({ ...options, cwd: rest[0] === "--all" ? undefined : process.cwd() });
-    }
-    else if (host === "codex" && command === "send" && rest.length === 3) result = await sendCodex(...rest, options);
-    else if (host === "codex" && command === "send" && rest.length === 4 && rest[0] === "--native") {
-      result = await sendCodex(...rest.slice(1), { ...options, delivery: "native" });
-    }
-    else if (host === "codex" && command === "send" && rest.length === 4 && rest[0] === "--queue") {
-      result = await sendCodex(...rest.slice(1), { ...options, delivery: "queue" });
-    }
-    else if (host === "codex" && command === "send" && rest.length === 4 && rest[0] === "--steer") {
-      result = await sendCodex(...rest.slice(1), { ...options, delivery: "steer" });
-    }
-    else if (host === "claude" && command === "list" && (rest.length === 0 || (rest.length === 1 && rest[0] === "--all"))) {
-      result = (await listClaudeSessions({ ...options, cwd: rest[0] === "--all" ? undefined : process.cwd() })).map(({ _record, ...item }) => item);
-    }
-    else if (host === "claude" && command === "send" && rest.length === 3) result = await sendClaude(...rest, options);
-    else {
-      console.error(usage());
-      process.exitCode = 2;
-      return;
+    if (parsed.command === "list") {
+      const listOptions = { ...options, cwd: parsed.all ? undefined : process.cwd() };
+      if (parsed.host === "codex") result = await listCodexSessions(listOptions);
+      else result = (await listClaudeSessions(listOptions)).map(({ _record, ...item }) => item);
+    } else {
+      const send = parsed.host === "codex" ? sendCodex : sendClaude;
+      const sendOptions = parsed.delivery ? { ...options, delivery: parsed.delivery } : options;
+      result = await send(...parsed.operands, sendOptions);
     }
     console.log(JSON.stringify(result, null, 2));
   } catch (error) {

@@ -1,6 +1,6 @@
 {
   "name": "agent-peer",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "List and message local Claude Code and Codex CLI sessions without a daemon",
   "author": { "name": "Zack" },
   "homepage": "https://github.com/noopz/agent-peer",

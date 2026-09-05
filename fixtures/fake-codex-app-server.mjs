@@ -14,7 +14,7 @@ lines.on("line", (line) => {
   if (frame.id == null) return;
   if (frame.method === "initialize") respond(frame.id, { userAgent: "fake" });
   else if (frame.method === "thread/list") respond(frame.id, {
-    data: [{ id: threadId, name: "fake-codex", status: { type: status }, cwd: process.cwd(), updatedAt: 1, source: "cli", parentThreadId: null }],
+    data: process.env.FAKE_CODEX_THREADS ? JSON.parse(process.env.FAKE_CODEX_THREADS) : [{ id: threadId, name: "fake-codex", status: { type: status }, cwd: process.cwd(), updatedAt: 1, source: "cli", parentThreadId: null }],
     nextCursor: null,
   });
   else if (frame.method === "thread/loaded/list") respond(frame.id, {

@@ -13,4 +13,4 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/agent-peer.mjs" codex list
 
 Only when the user explicitly asks for sessions across every project, add `--all`.
 
-Use the exact `id` as the safest send target. An exact unique `name` is also accepted. On macOS and Linux, entries combine running Codex TUI process working directories with the stock shared app-server's loaded-thread metadata. On Windows or when that endpoint is unavailable, Agent Peer falls back to Codex's writer-lock registry and state store.
+Use the exact `id` as the safest send target. An exact unique `name` is also accepted. On macOS and Linux, entries combine running Codex TUI process working directories with the stock shared app-server's loaded-thread metadata. On Windows, discovery uses loaded top-level user threads directly. When the shared endpoint is unavailable, Agent Peer falls back to Codex's writer-lock registry and state store.
