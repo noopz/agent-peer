@@ -1,6 +1,6 @@
 {
   "name": "agent-peer",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Daemonless local messaging between Claude Code and Codex CLI sessions",
   "type": "module",
   "bin": {

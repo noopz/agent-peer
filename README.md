@@ -63,11 +63,15 @@ Claude receives messages with immediate priority. If it is already working, the 
 
 Claude-to-Codex messages use native Codex delegation by default. An idle target starts the delegated turn immediately. A busy target receives the message in its active turn at the next model boundary without interrupting an in-flight tool call. The TUI persists and renders the request as delegated work instead of ordinary user text.
 
-If the stock shared app-server endpoint is unavailable, Agent Peer automatically falls back to `codex queue`. Queued delivery starts a separate turn: idle sessions normally begin within about ten seconds, busy sessions process it after their current turn, and interrupted threads must be resumed before queued input dispatches. Use `--queue` to force it, or `--native` to fail instead of falling back.
+If the stock shared app-server endpoint is unavailable or Codex explicitly rejects the native request, Agent Peer automatically falls back to `codex queue`. Queued delivery starts a separate turn: idle sessions normally begin within about ten seconds, busy sessions process it after their current turn, and interrupted threads must be resumed before queued input dispatches. Use `--queue` to force it, or `--native` to fail instead of falling back.
+
+If a native or steering request was submitted but its response is lost, Agent Peer reports `DELIVERY_UNKNOWN` and does not queue a second copy. A queue command that starts and then fails also reports an unknown outcome. Check the recipient before retrying; the message may already have been accepted.
+
+Subprocesses have a 30-second deadline and a combined 16 MiB output limit. Cleanup uses bounded termination through Node APIs.
 
 On macOS and Linux, Agent Peer connects directly to Codex's control socket. On Windows, it runs the stock `codex app-server proxy` command for the duration of each operation because Codex uses its own Windows Unix-socket compatibility layer. The proxy exits when the operation ends; there is no Agent Peer daemon or special Codex launcher.
 
-On Codex 0.151 or newer, `codex send --steer` explicitly injects ordinary user text into the current turn. Use it only for informational updates when that distinction is intentional; delegated work should use the default native path. If no turn is active, the shared endpoint is unavailable, or steering fails, Agent Peer falls back to the queue.
+On Codex 0.151 or newer, `codex send --steer` explicitly injects ordinary user text into the current turn. Use it only for informational updates when that distinction is intentional; delegated work should use the default native path. If no turn is active, the shared endpoint is unavailable, or Codex explicitly rejects steering, Agent Peer falls back to the queue. A lost response after steering was submitted is reported as unknown delivery.
 
 Claude validates local peer credentials and applies its inbound-message policy. It can hold a cross-session message for confirmation. Users who want automatic local delivery can add this to their Claude user settings:
 

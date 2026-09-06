@@ -35,4 +35,4 @@ Only when the user explicitly asks to inject an informational update into Codex'
 node "${CLAUDE_PLUGIN_ROOT}/scripts/agent-peer.mjs" codex send --steer "<target>" "<summary>" "<message>"
 ```
 
-Do not use `--steer` for delegated work or any request that may require tools, filesystem access, network access, or other permissions. Steering falls back to the queue when no turn is active.
+Do not use `--steer` for delegated work or any request that may require tools, filesystem access, network access, or other permissions. Steering falls back to the queue when no turn is active. If delivery reports `DELIVERY_UNKNOWN`, tell the user the recipient may already have accepted the message. Do not retry or force queue delivery; inspect the recipient before considering another send.

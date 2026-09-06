@@ -193,3 +193,69 @@ test("a repeated discovery cursor stops pagination and permits registry fallback
   assert.deepEqual(listed, []);
   assert.equal(requests.filter((request) => request.method === "thread/loaded/list").length, 2);
 });
+
+for (const delivery of [undefined, "steer"]) {
+  for (const failure of ["disconnect", "timeout", "malformed reply"]) {
+    test(`${delivery || "native"} delivery never queues after submission followed by ${failure}`, async (t) => {
+      let submitted = 0;
+      const { options } = await controlServer(t, {
+        respond(socket, request) {
+          if (["turn/start", "turn/steer"].includes(request.method)) {
+            submitted++;
+            if (failure === "disconnect") socket.destroy();
+            if (failure === "malformed reply") socket.write(frame(JSON.stringify({ id: request.id })));
+            return;
+          }
+          let result = {};
+          if (request.method === "thread/loaded/list") result = { data: ["test-thread"] };
+          if (request.method === "thread/turns/list") result = { data: [{ id: "active-turn", status: "inProgress" }] };
+          socket.write(frame(JSON.stringify({ id: request.id, result })));
+        },
+      });
+      await assert.rejects(sendCodex("test-thread", "test", "hello", {
+        ...options,
+        delivery,
+        timeoutMs: 100,
+        queueCodex: async () => assert.fail("must not queue an ambiguously delivered message"),
+      }), { code: "DELIVERY_UNKNOWN" });
+      assert.equal(submitted, 1);
+    });
+  }
+}
+
+for (const delivery of [undefined, "steer"]) {
+  test(`${delivery || "native"} delivery still queues after an explicit rejection`, async (t) => {
+    const { options } = await controlServer(t, {
+      respond(socket, request) {
+        if (["turn/start", "turn/steer"].includes(request.method)) {
+          socket.write(frame(JSON.stringify({ id: request.id, error: { message: "unsupported request" } })));
+          return;
+        }
+        let result = {};
+        if (request.method === "thread/loaded/list") result = { data: ["test-thread"] };
+        if (request.method === "thread/turns/list") result = { data: [{ id: "active-turn", status: "inProgress" }] };
+        socket.write(frame(JSON.stringify({ id: request.id, result })));
+      },
+    });
+    let queued = 0;
+    const result = await sendCodex("test-thread", "test", "hello", {
+      ...options,
+      delivery,
+      queueCodex: async () => { queued++; return { queueItemId: "queued" }; },
+    });
+    assert.equal(result.delivery, "queued");
+    assert.equal(queued, 1);
+  });
+}
+
+test("a noisy proxy rejects through the shared subprocess output limit", async (t) => {
+  const { options } = await controlServer(t);
+  await assert.rejects(sendCodex("test-thread", "test", "hello", {
+    ...options,
+    codexBin: process.execPath,
+    codexProxyArgs: ["-e", "process.stderr.write('x'.repeat(10000)); setInterval(() => {}, 1000)"],
+    codexWebSocketEndpoint: { path: "test-control-endpoint", proxy: true },
+    maxOutputBytes: 100,
+    killGraceMs: 50,
+  }), /output exceeded/);
+});

@@ -5,7 +5,8 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
-import { createRpcClient } from "./rpc.mjs";
+import { createRpcClient, DeliveryUnknownError } from "./rpc.mjs";
+import { spawnCapture, superviseProcess } from "./process.mjs";
 import { createWebSocketDecoder, validateWebSocketUpgrade, websocketFrame } from "./websocket.mjs";
 
 const { version: AGENT_PEER_VERSION } = await readJson(new URL("../package.json", import.meta.url));
@@ -267,10 +268,7 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
   const readable = proxy ? proxy.stdout : socket;
   const writable = proxy ? proxy.stdin : socket;
   let stderr = "";
-  if (proxy) {
-    proxy.stderr.setEncoding("utf8");
-    proxy.stderr.on("data", (chunk) => { stderr += chunk; });
-  }
+  let managed;
   const key = crypto.randomBytes(16).toString("base64");
   let wire = Buffer.alloc(0);
   let handshaken = false;
@@ -282,12 +280,8 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
     writable.write(websocketFrame(payload, 0xA));
   });
   const stop = () => {
-    if (proxy) {
-      proxy.stdin.destroy();
-      proxy.stdout.destroy();
-      proxy.stderr.destroy();
-      proxy.kill();
-    } else socket.destroy();
+    if (managed) return managed.stop();
+    socket.destroy();
   };
   const fail = (error) => {
     rejectOpened(error);
@@ -340,6 +334,11 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
       }
     });
   });
+  if (proxy) {
+    managed = superviseProcess(proxy, fail, options);
+    proxy.stderr.setEncoding("utf8");
+    proxy.stderr.on("data", (chunk) => { if (!managed.error) stderr += chunk; });
+  }
   const upgradeTimeout = setTimeout(() => fail(new Error("timed out upgrading codex app-server websocket")), options.timeoutMs ?? 10_000);
   try {
     await opened;
@@ -349,7 +348,7 @@ async function withCodexWebSocket(callback, endpoint, options = {}) {
   } finally {
     clearTimeout(upgradeTimeout);
     rpc.close();
-    stop();
+    await stop();
   }
 }
 
@@ -383,18 +382,16 @@ async function withCodexAppServer(callback, options = {}) {
   const env = options.env || process.env;
   const codexBin = options.codexBin || env.AGENT_PEER_CODEX_BIN || "codex";
   const child = spawn(codexBin, options.codexAppServerArgs || ["app-server"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env });
-  let stderr = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const lines = readline.createInterface({ input: child.stdout });
   const rpc = createRpcClient((message) => {
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
   }, options.timeoutMs);
+  const managed = superviseProcess(child, rpc.close, options);
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { if (!managed.error) stderr += chunk; });
+  const lines = readline.createInterface({ input: child.stdout });
   lines.on("line", rpc.receive);
-  child.once("error", rpc.close);
-  child.stdin.once("error", rpc.close);
-  child.stdout.once("error", rpc.close);
-  child.once("exit", (code) => {
+  child.once("close", (code) => {
     rpc.close(new Error(`codex app-server exited with ${code}`));
   });
   try {
@@ -404,14 +401,9 @@ async function withCodexAppServer(callback, options = {}) {
     const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
     throw new Error(`${errorMessage(error)}${suffix}`);
   } finally {
-    const closed = child.exitCode === null && child.signalCode === null
-      ? new Promise((resolve) => child.once("close", resolve))
-      : Promise.resolve();
     rpc.close();
     lines.close();
-    child.stdin.end();
-    child.kill();
-    await closed;
+    await managed.stop();
   }
 }
 
@@ -574,23 +566,6 @@ export function isTopLevelCodexThread(thread) {
   return !("subagent" in source);
 }
 
-async function spawnCapture(command, args, options = {}) {
-  return await new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: options.env || process.env });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.once("error", reject);
-    child.once("close", (code) => {
-      if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`${command} exited with ${code}: ${stderr.trim() || stdout.trim()}`));
-    });
-  });
-}
-
 async function steerCodexCurrentTurn(threadId, content, options = {}) {
   const endpoint = await codexWebSocketEndpoint(options);
   if (!endpoint) return null;
@@ -615,8 +590,8 @@ async function steerCodexCurrentTurn(threadId, content, options = {}) {
       expectedTurnId: activeTurn.id,
       input: [{ type: "text", text: content, text_elements: [] }],
       clientUserMessageId: crypto.randomUUID(),
-    });
-    return { turnId: steered.turnId || activeTurn.id };
+    }, { mutation: true });
+    return { turnId: steered?.turnId || activeTurn.id };
   }, endpoint, options);
 }
 
@@ -632,7 +607,7 @@ async function startNativeCodexDelegation(threadId, message, origin, options = {
         namespace: "codex_app",
         output: codexDelegationFromClaude(message, origin),
       },
-    });
+    }, { mutation: true });
     return { turnId: started?.turn?.id || null };
   }, endpoint, options);
 }
@@ -666,7 +641,7 @@ export async function sendCodex(target, summary, message, options = {}) {
         : await startNativeCodexDelegation(recipient.id, message, origin, options);
       return { ...result, delivery: "native", turnId: delegated.turnId };
     } catch (error) {
-      if (options.delivery === "native") throw error;
+      if (error instanceof DeliveryUnknownError || options.delivery === "native") throw error;
       if (env.AGENT_PEER_DEBUG) process.stderr.write(`Native Codex delegation unavailable; using queue: ${errorMessage(error)}\n`);
     }
   }
@@ -678,14 +653,21 @@ export async function sendCodex(target, summary, message, options = {}) {
         ? await options.steerCodex(recipient.id, content)
         : await steerCodexCurrentTurn(recipient.id, content, options);
     } catch (error) {
+      if (error instanceof DeliveryUnknownError) throw error;
       if (env.AGENT_PEER_DEBUG) process.stderr.write(`Codex steering unavailable; using queue: ${errorMessage(error)}\n`);
     }
     if (steered) return { ...result, delivery: "steered", turnId: steered.turnId };
   }
   const codexBin = options.codexBin || env.AGENT_PEER_CODEX_BIN || "codex";
-  const queued = options.queueCodex
-    ? await options.queueCodex(recipient.id, content)
-    : await spawnCapture(codexBin, ["queue", "--thread", recipient.id, "--message", content], options);
+  let queued;
+  try {
+    queued = options.queueCodex
+      ? await options.queueCodex(recipient.id, content)
+      : await spawnCapture(codexBin, ["queue", "--thread", recipient.id, "--message", content], options);
+  } catch (error) {
+    if (error.commandStarted) throw new DeliveryUnknownError("codex queue", error);
+    throw error;
+  }
   const stdout = queued.stdout || "";
   return {
     ...result,

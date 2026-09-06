@@ -56,3 +56,42 @@ test("late replies after a deadline do not interfere with subsequent requests", 
   assert.equal(await next, "on time");
   rpc.close();
 });
+
+test("a submitted mutation with a lost response reports an unknown outcome", async () => {
+  const rpc = createRpcClient(() => {});
+  const pending = assert.rejects(rpc.request("turn/start", {}, { mutation: true }), { code: "DELIVERY_UNKNOWN" });
+  rpc.close(new Error("connection lost"));
+  await pending;
+});
+
+test("an explicit mutation rejection remains distinguishable from a lost response", async () => {
+  let sent;
+  const rpc = createRpcClient((message) => { sent = message; });
+  const pending = assert.rejects(rpc.request("turn/start", {}, { mutation: true }), (error) => {
+    assert.equal(error.message, "rejected");
+    assert.notEqual(error.code, "DELIVERY_UNKNOWN");
+    return true;
+  });
+  rpc.receive(JSON.stringify({ id: sent.id, error: { message: "rejected" } }));
+  await pending;
+  rpc.close();
+});
+
+test("a mutation on an already failed connection was never submitted", async () => {
+  const rpc = createRpcClient(() => assert.fail("must not write"));
+  rpc.close(new Error("connection lost"));
+  await assert.rejects(rpc.request("turn/start", {}, { mutation: true }), (error) => {
+    assert.equal(error.message, "connection lost");
+    assert.notEqual(error.code, "DELIVERY_UNKNOWN");
+    return true;
+  });
+});
+
+test("failure after an acknowledged mutation cannot replace its success", async () => {
+  let sent;
+  const rpc = createRpcClient((message) => { sent = message; });
+  const result = rpc.request("turn/start", {}, { mutation: true });
+  rpc.receive(JSON.stringify({ id: sent.id, result: { turn: { id: "accepted" } } }));
+  rpc.close(new Error("connection lost"));
+  assert.deepEqual(await result, { turn: { id: "accepted" } });
+});

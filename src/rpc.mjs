@@ -1,3 +1,11 @@
+export class DeliveryUnknownError extends Error {
+  constructor(method, cause) {
+    super(`delivery outcome unknown for ${method}; the request may have been accepted. No automatic retry was attempted. Check the recipient before retrying.`, { cause });
+    this.name = "DeliveryUnknownError";
+    this.code = "DELIVERY_UNKNOWN";
+  }
+}
+
 // The transports supply encoding; request IDs, replies, deadlines, and failure
 // propagation have the same lifecycle for both WebSocket and stdio.
 export function createRpcClient(send, timeoutMs = 10_000) {
@@ -5,12 +13,14 @@ export function createRpcClient(send, timeoutMs = 10_000) {
   let failure;
   const pending = new Map();
 
-  function settle(id, error, result) {
+  function settle(id, error, result, responded = false) {
     const waiter = pending.get(id);
     if (!waiter) return;
     pending.delete(id);
     clearTimeout(waiter.timeout);
-    if (error) waiter.reject(error);
+    if (error && waiter.mutation && !responded) {
+      waiter.reject(new DeliveryUnknownError(waiter.method, error));
+    } else if (error) waiter.reject(error);
     else waiter.resolve(result);
   }
 
@@ -19,14 +29,14 @@ export function createRpcClient(send, timeoutMs = 10_000) {
     for (const id of pending.keys()) settle(id, failure);
   }
 
-  function request(method, params) {
+  function request(method, params, { mutation = false } = {}) {
     if (failure) return Promise.reject(failure);
     return new Promise((resolve, reject) => {
       const id = nextId++;
       const timeout = setTimeout(() => {
         settle(id, new Error(`timed out waiting for codex app-server method ${method}`));
       }, timeoutMs);
-      pending.set(id, { resolve, reject, timeout });
+      pending.set(id, { resolve, reject, timeout, method, mutation });
       try {
         send({ id, method, params });
       } catch (error) {
@@ -39,10 +49,12 @@ export function createRpcClient(send, timeoutMs = 10_000) {
     let message;
     try { message = JSON.parse(payload); } catch { return; }
     if (message?.id == null) return;
+    // An ID alone is not an acknowledgement of success or rejection.
+    if (!Object.hasOwn(message, "result") && !message.error) return;
     const error = message.error
       ? new Error(message.error.message || JSON.stringify(message.error))
       : null;
-    settle(message.id, error, message.result);
+    settle(message.id, error, message.result, true);
   }
 
   function notify(method, params) {

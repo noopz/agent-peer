@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { spawnCapture } from "../src/process.mjs";
 import {
   authLineForClaudeSession,
   codexDelegationFromClaude,
@@ -310,4 +311,41 @@ test("Claude registry scans ignore corrupt records and preserve origin records w
   assert.deepEqual(await currentClaudeSession(options), origin);
   assert.deepEqual(await listClaudeSessions(options), []);
   await assert.rejects(sendClaude("origin-name", "test", "message", options), /exactly one registered/);
+});
+
+for (const [name, script, expected] of [
+  ["stall", "setInterval(() => {}, 1000)", /subprocess timed out/],
+  ["unbounded output", "process.stdout.write('x'.repeat(10000)); setInterval(() => {}, 1000)", /output exceeded/],
+]) {
+  test(`stdio app-server discovery rejects ${name} through the process supervisor`, async (t) => {
+    const { options } = await fakeCodexSession(t);
+    await assert.rejects(listCodexSessions({
+      ...options,
+      codexAppServerArgs: ["-e", script],
+      processTimeoutMs: 200,
+      maxOutputBytes: 100,
+      killGraceMs: 50,
+    }), expected);
+  });
+}
+
+
+test("a queue subprocess timeout reports unknown delivery without retrying", async (t) => {
+  const { threadId, options } = await fakeCodexSession(t);
+  let attempts = 0;
+  await assert.rejects(sendCodex(threadId, "test", "hello", {
+    ...options,
+    delivery: "queue",
+    queueCodex: async () => {
+      attempts++;
+      return await spawnCapture(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        processTimeoutMs: 100, killGraceMs: 50,
+      });
+    },
+  }), (error) => {
+    assert.equal(error.code, "DELIVERY_UNKNOWN");
+    assert.match(error.cause.message, /timed out/);
+    return true;
+  });
+  assert.equal(attempts, 1);
 });
