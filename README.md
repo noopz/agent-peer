@@ -85,6 +85,15 @@ Agent Peer resolves only exact unique names, exact thread IDs, or exact local ad
 
 Implementation rationale and pinned upstream references live in the [architecture decision records](docs/adr/README.md).
 
-On macOS and Linux, Codex discovery combines running `codex` TUI process working directories with loaded top-level user threads from the stock shared app-server. When multiple loaded threads share a directory, the newest threads are matched to the number of running TUI processes there. Windows discovery uses the app-server's loaded top-level user threads directly because Windows does not expose another process's working directory through the same standard tools. When the shared endpoint is unavailable, Agent Peer combines writer-lock filenames with the state store; an abnormally terminated process can leave a stale entry until Codex cleans its locks.
+On macOS and Linux, Codex discovery combines running `codex` TUI process working directories with loaded top-level user threads from the stock shared app-server. When multiple loaded threads share a directory, active threads are preferred, followed by the most recently updated threads, up to the number of running TUI processes there. This matching is a heuristic; an exact thread ID is the safest recipient. Windows discovery uses the app-server's loaded top-level user threads directly because Windows does not expose another process's working directory through the same standard tools. When the shared endpoint is unavailable, Agent Peer combines writer-lock filenames with the state store; an abnormally terminated process can leave a stale entry until Codex cleans its locks.
 
 Codex's shell sandbox does not allow probing Claude's local IPC endpoints. The bundled Codex skills request narrowly scoped host IPC access for Claude discovery and delivery; this is automatically handled according to the user's Codex approval policy.
+
+## Troubleshooting
+
+- **No sessions listed:** listing is restricted to the current working directory. Check that both terminals are in the same project; use `--all` to inspect other directories. Start or resume the target session. Codex must have permission to access local Claude IPC endpoints.
+- **Recipient is ambiguous:** use the exact Codex thread ID or Claude local address from the list output. Names must identify exactly one session.
+- **Delivery is queued:** native delivery was unavailable or explicitly rejected. The message waits for a separate turn; an interrupted Codex thread may need to be resumed. Do not send it again just because it has not appeared yet.
+- **Delivery outcome unknown:** the recipient may already have accepted the message. Inspect its conversation before retrying; forcing `--queue` can create a duplicate.
+
+For a bug report, include your operating system, Node version, both CLI versions, Agent Peer version, command type, and error. Remove message contents, local paths, session IDs, and credentials. Set `AGENT_PEER_DEBUG=1` in the helper's environment for fallback diagnostics when needed; review those diagnostics before sharing them.
